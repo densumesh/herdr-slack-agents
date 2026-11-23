@@ -56,7 +56,9 @@ herdr plugin action invoke densumesh.slack-agents.status     # connected? last l
 - State and logs (0700): `~/.local/state/slack-agents/` (`relay.log`, `relay.stderr`, `state.json`, `inbox/`).
 - Wake-ups ride on `$XDG_RUNTIME_DIR/slack-relay`; without it the relay falls back to a 30 s poll.
 
-Only the configured owner's DMs and button taps are acted on. Anyone holding the bot token can post as the bot;
+Only the owner can steer agents: messages, button taps and stop requests are acted on only when they come from
+`OWNER_SLACK_USER` in that user's own DM with the bot; anything else (other people DMing the bot, channels, other
+DMs) is dropped and logged. Config and state are readable only by you. Anyone holding the bot token can post as the bot;
 anyone who can send Slack messages as the owner can run Claude on this machine with `CLAUDE_ARGS` permissions.
 
 ## Uninstall

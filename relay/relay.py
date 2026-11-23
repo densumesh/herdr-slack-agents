@@ -261,8 +261,6 @@ def on_message(ev):
 
 
 def on_button(payload):
-    if payload["user"]["id"] != cfg["OWNER_SLACK_USER"]:
-        return
     action, msg, channel = payload["actions"][0], payload["message"], payload["channel"]["id"]
     choice = action["value"]
     blocks = [b for b in msg.get("blocks", []) if b.get("type") != "actions"]
@@ -591,19 +589,38 @@ def guarded(fn, *args, channel=None, ts=None):
             react(channel, ts, "x")
 
 
+def from_owner(user, channel):
+    """Only the owner, and only in the owner's DM with the bot, can steer agents; everything else is dropped."""
+    return user == cfg["OWNER_SLACK_USER"] and channel == dm_channel
+
+
 def on_request(client: SocketModeClient, req: SocketModeRequest):
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
     if req.type == "interactive" and req.payload.get("type") == "block_actions":
-        threading.Thread(target=guarded, args=(on_button, req.payload), daemon=True).start()
+        p = req.payload
+        if from_owner((p.get("user") or {}).get("id"), (p.get("channel") or {}).get("id")):
+            threading.Thread(target=guarded, args=(on_button, p), daemon=True).start()
+        else:
+            log.warning("ignored a button tap from %s", (p.get("user") or {}).get("id"))
         return
     if req.type != "events_api":
         return
     ev = req.payload.get("event", {})
     if ev.get("type") == "agent_session_stopped":
-        threading.Thread(target=guarded, args=(on_stop, ev), daemon=True).start()
+        # the event's user/channel fields aren't documented; reject on any that is present and isn't the owner's,
+        # and on_stop only acts on threads the relay itself opened (all in the owner's DM)
+        user = ev.get("user") or ev.get("user_id")
+        channel = ev.get("channel") or ev.get("channel_id") or (ev.get("session") or {}).get("channel_id")
+        if user in (None, cfg["OWNER_SLACK_USER"]) and channel in (None, dm_channel):
+            threading.Thread(target=guarded, args=(on_stop, ev), daemon=True).start()
+        else:
+            log.warning("ignored a stop not from the owner's DM: %s", ev)
         return
-    if (ev.get("type") != "message" or ev.get("channel_type") != "im" or ev.get("subtype") not in (None, "file_share")
-            or ev.get("user") != cfg["OWNER_SLACK_USER"] or ev["ts"] in seen):
+    if ev.get("type") != "message" or ev.get("subtype") not in (None, "file_share") or ev["ts"] in seen:
+        return
+    if ev.get("channel_type") != "im" or not from_owner(ev.get("user"), ev.get("channel")):
+        if not ev.get("bot_id"):  # the bot's own posts echo back here too
+            log.warning("ignored a message from %s in %s", ev.get("user"), ev.get("channel"))
         return
     seen.add(ev["ts"])
     threading.Thread(target=guarded, args=(on_message, ev), kwargs={"channel": ev["channel"], "ts": ev["ts"]},

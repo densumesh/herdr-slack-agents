@@ -5,7 +5,7 @@
 # One relay per user, guarded by STATE/relay.lock (shared across hosts on an NFS home: relay.pid names the host).
 set -u
 . "$(dirname "$(readlink -f "$0")")/env.sh"
-mkdir -p "$STATE" && chmod 700 "$STATE"
+mkdir -p "$STATE" && chmod -R go-rwx "$STATE" "$CONFIG" 2>/dev/null
 LOCK="$STATE/relay.lock"
 HOST=$(hostname)
 
