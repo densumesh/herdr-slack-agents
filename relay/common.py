@@ -6,20 +6,24 @@ CLAUDE_ARGS. State (STATE_DIR/state.json):
   waiting[ts]   -> a --wait caller blocked on the owner's next reply in that thread
   acks[ts]      -> a delivered reply whose agent turn is still running (👀, narration mirroring)
 Replies for --wait land in replies/<ts>.txt; files the owner sends land in inbox/.
-Both dirs default to herdr's plugin dirs; SLACK_AGENTS_CONFIG_DIR / SLACK_AGENTS_STATE_DIR override them.
+CONFIG_DIR = ~/.config/slack-agents, STATE_DIR = ~/.local/state/slack-agents (XDG dirs honoured), fixed so that
+herdr-launched commands, agents and plain shells all agree; SLACK_AGENTS_CONFIG_DIR / _STATE_DIR override them.
 """
 import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-PLUGIN_ID = "densumesh.slack-agents"
-CONFIG_DIR = Path(os.environ.get("SLACK_AGENTS_CONFIG_DIR") or Path.home() / ".config/herdr/plugins/config" / PLUGIN_ID)
-STATE_DIR = Path(os.environ.get("SLACK_AGENTS_STATE_DIR") or Path.home() / ".local/state/herdr/plugins" / PLUGIN_ID)
+os.umask(0o077)  # state holds DM text and the owner's attachments; config holds tokens
+CONFIG_DIR = Path(os.environ.get("SLACK_AGENTS_CONFIG_DIR")
+                  or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "slack-agents")
+STATE_DIR = Path(os.environ.get("SLACK_AGENTS_STATE_DIR")
+                 or Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "slack-agents")
 TOKENS = CONFIG_DIR / "tokens.env"
 STATE = STATE_DIR / "state.json"
 REPLIES = STATE_DIR / "replies"
@@ -36,17 +40,37 @@ STATUS = {
 }
 
 
-def load_config():
+def read_env(path):
+    """KEY=VALUE lines; a value wrapped in one matching pair of quotes loses only that pair."""
     cfg = {}
-    for line in TOKENS.read_text().splitlines():
+    for line in path.read_text().splitlines() if path.exists() else []:
         if "=" in line and not line.lstrip().startswith("#"):
             k, v = line.split("=", 1)
-            cfg[k.strip()] = v.strip().strip("'\"")
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                v = v[1:-1]
+            cfg[k.strip()] = v
+    return cfg
+
+
+def load_config():
+    cfg = read_env(TOKENS)
     missing = [k for k in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "OWNER_SLACK_USER") if not cfg.get(k)]
     if missing:
         raise SystemExit(f"{TOKENS}: missing {', '.join(missing)} (run the plugin's bin/setup)")
-    cfg.setdefault("OWNER_NAME", "the owner")
+    cfg["OWNER_NAME"] = cfg.get("OWNER_NAME") or "the owner"
+    cfg["CLAUDE_ARGV"] = shlex.split(cfg.get("CLAUDE_ARGS", ""))  # bad quoting fails here, at start-up
     return cfg
+
+
+def relay_running():
+    """True while a relay supervisor holds the lock (on any host sharing this home)."""
+    try:
+        with open(STATE_DIR / "relay.lock", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+    except BlockingIOError:
+        return True
 
 
 @contextmanager
@@ -66,7 +90,8 @@ def state():
         os.replace(tmp, STATE)
 
 
-HERDR = os.environ.get("HERDR_BIN_PATH") or "herdr"
+HERDR = os.environ.get("HERDR_BIN_PATH", "")
+HERDR = HERDR if os.access(HERDR, os.X_OK) else "herdr"  # a herdr upgrade can leave the inherited path stale
 
 
 def herdr(*args, timeout=60):
@@ -75,6 +100,8 @@ def herdr(*args, timeout=60):
         p = subprocess.run([HERDR, *args], capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, "herdr timed out"
+    except OSError as e:  # binary missing, e.g. a stale HERDR_BIN_PATH after a herdr upgrade
+        return False, f"can't run {HERDR}: {e}"
     out = p.stdout if p.returncode == 0 else p.stderr
     try:
         return p.returncode == 0, json.loads(out)

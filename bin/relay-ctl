@@ -1,60 +1,94 @@
 #!/bin/sh
 # relay-ctl ensure|start|stop|restart|status — run the Slack relay as a detached, self-restarting process.
-# `ensure` is the herdr startup hook: it points STATE/current at this installation and (re)starts the relay
-# when it is down or still running an older installation. One relay per user, guarded by STATE/relay.lock.
+# `ensure` is the herdr startup hook: it points STATE/current at this installation and (re)starts the relay when it
+# is down, runs other code (plugin update, git pull), or is bound to a herdr socket that no longer exists.
+# One relay per user, guarded by STATE/relay.lock (shared across hosts on an NFS home: relay.pid names the host).
 set -u
 . "$(dirname "$(readlink -f "$0")")/env.sh"
-mkdir -p "$STATE"
+mkdir -p "$STATE" && chmod 700 "$STATE"
 LOCK="$STATE/relay.lock"
+HOST=$(hostname)
 
 running() { [ -e "$LOCK" ] && ! flock -n "$LOCK" true; }
-pid() { cat "$STATE/relay.pid" 2>/dev/null; }
+pid() { cut -d' ' -f1 "$STATE/relay.pid" 2>/dev/null; }
+pidhost() { cut -d' ' -f2 "$STATE/relay.pid" 2>/dev/null; }
+fingerprint() { cat "$ROOT"/relay/*.py | md5sum | cut -d' ' -f1; }
+run_id() { printf 'root=%s\nsocket=%s\ncode=%s\n' "$ROOT" "${HERDR_SOCKET_PATH:-}" "$(fingerprint)"; }
+recorded() { sed -n "s/^$1=//p" "$STATE/relay.run" 2>/dev/null; }
+
+connected() {  # the relay writes relay.connected (its pid) once Slack accepted the tokens
+    c=$(cut -d' ' -f1 "$STATE/relay.connected" 2>/dev/null)
+    [ -n "$c" ] && [ "$(pidhost)" = "$HOST" ] && kill -0 "$c" 2>/dev/null
+}
 
 start() {
+    ln -sfn "$ROOT" "$STATE/current"
     if [ ! -s "$CONFIG/tokens.env" ]; then
-        echo "slack-agents: not configured ($CONFIG/tokens.env missing); run setup first" >&2
+        echo "slack-agents: not configured ($CONFIG/tokens.env missing); run setup" >&2
         return 1
     fi
-    if [ ! -x "$PY" ]; then
-        echo "slack-agents: no venv at $ROOT/.venv; run setup first" >&2
+    if ! "$PY" -c "import slack_sdk.socket_mode" 2>/dev/null; then
+        echo "slack-agents: venv at $ROOT/.venv is missing or broken; run setup" >&2
         return 1
     fi
-    running && { echo "relay already running (pid $(pid))"; return 0; }
-    setsid -f "$ROOT/bin/relay-ctl" _supervise </dev/null >/dev/null 2>&1
-    for _ in 1 2 3 4 5 6 7 8 9 10; do running && break; sleep 0.2; done
-    running && echo "relay started (pid $(pid), $ROOT)" || { echo "relay failed to start" >&2; return 1; }
+    running && { echo "relay already running (pid $(pid) on $(pidhost))"; return 0; }
+    # herdr's per-invocation context would be stale for a long-lived daemon; keep only the socket and binary
+    ( unset HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_PLUGIN_CONTEXT_JSON HERDR_PLUGIN_ACTION_ID \
+            HERDR_PLUGIN_EVENT HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_ENTRYPOINT_ID HERDR_ENV
+      cd "$ROOT/relay" && setsid -f "$PY" supervise.py "$(run_id)" </dev/null >/dev/null 2>>"$STATE/relay.stderr" )
+    for _ in $(seq 100); do connected && break; sleep 0.2; done
+    if connected; then echo "relay connected (pid $(pid), $ROOT)"; return 0; fi
+    echo "relay started but not connected to Slack after 20 s; last errors:" >&2
+    tail -n 5 "$STATE/relay.stderr" >&2
+    return 1
 }
 
 stop() {
     running || { echo "relay not running"; return 0; }
+    if [ "$(pidhost)" != "$HOST" ]; then
+        echo "relay runs on $(pidhost), not $HOST; stop it there" >&2
+        return 1
+    fi
     p=$(pid)
-    [ -n "$p" ] && /bin/kill -TERM "$p"
+    [ -n "$p" ] && kill -TERM "$p"
     for _ in $(seq 150); do running || break; sleep 0.1; done
     if running; then  # the supervisor leads its own process group (setsid): take the relay down with it
-        /bin/kill -KILL -- "-$p"
+        kill -KILL -- "-$p"
         sleep 0.5
     fi
     running && { echo "relay (pid $p) did not stop" >&2; return 1; }
     echo "relay stopped"
 }
 
+stale() {  # why a running relay should be restarted by ensure (empty = keep it)
+    [ "$(recorded root)" != "$ROOT" ] && { echo "installation changed"; return; }
+    [ "$(recorded code)" != "$(fingerprint)" ] && { echo "code changed"; return; }
+    s=$(recorded socket)
+    [ -n "$s" ] && [ ! -S "$s" ] && echo "its herdr socket $s is gone"
+}
+
 case "${1:-}" in
-_supervise)
-    # herdr's per-invocation context would be stale for a long-lived daemon; keep only the socket and binary
-    unset HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_PLUGIN_CONTEXT_JSON HERDR_PLUGIN_ACTION_ID \
-          HERDR_PLUGIN_EVENT HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_ENTRYPOINT_ID HERDR_ENV
-    cd "$ROOT/relay" && exec "$PY" supervise.py ;;
 ensure)
     ln -sfn "$ROOT" "$STATE/current"
-    if running && [ "$(cat "$STATE/relay.root" 2>/dev/null)" != "$ROOT" ]; then stop; fi
-    if [ -s "$CONFIG/tokens.env" ]; then start; else echo "slack-agents: not configured yet; run setup"; fi ;;
+    [ -s "$CONFIG/tokens.env" ] || { echo "slack-agents: not configured yet; run setup"; exit 0; }
+    if running; then
+        why=$(stale)
+        if [ -n "$why" ] && [ "$(pidhost)" = "$HOST" ]; then echo "restarting relay: $why"; stop && start
+        else echo "relay running (pid $(pid) on $(pidhost))"; fi
+    else
+        start
+    fi ;;
 start) start ;;
 stop) stop ;;
 restart) stop && start ;;
 status)
-    if running; then echo "relay running (pid $(pid), $(cat "$STATE/relay.root" 2>/dev/null))"
-    else echo "relay not running"; fi
+    if ! running; then echo "relay NOT running"
+    elif connected; then echo "relay connected (pid $(pid), $(recorded root))"
+    elif [ "$(pidhost)" != "$HOST" ]; then echo "relay running on $(pidhost) (pid $(pid))"
+    else echo "relay running but NOT connected to Slack (failing and retrying; see below)"; fi
+    w=$(stale); [ -n "$w" ] && echo "note: $w since it started; restart to pick that up"
     echo "config: $CONFIG"; echo "state:  $STATE"
-    tail -n 5 "$STATE/relay.log" 2>/dev/null ;;
+    echo "--- relay.log"; tail -n 3 "$STATE/relay.log" 2>/dev/null
+    echo "--- relay.stderr"; tail -n 3 "$STATE/relay.stderr" 2>/dev/null ;;
 *) echo "usage: relay-ctl ensure|start|stop|restart|status" >&2; exit 2 ;;
 esac

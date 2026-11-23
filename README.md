@@ -21,34 +21,45 @@ integration (`herdr integration install claude`).
    with `connections:write` (`xapp-...`). Your member id: Slack profile -> ⋯ -> Copy member ID.
 2. Plugin, from GitHub: `herdr plugin install densumesh/herdr-slack-agents --yes` (herdr builds the venv),
    or from any git host: `git clone https://github.com/densumesh/herdr-slack-agents ~/herdr-slack-agents && herdr plugin link ~/herdr-slack-agents`.
-3. Setup (prompts for the tokens, checks them with Slack, adds the Claude hook, links `~/.local/bin/slack-ping`,
-   installs the `slack-ping` skill, starts the relay):
+3. Setup: prompts for the tokens and checks them with Slack, asks whether Claudes started from a DM may skip
+   permission prompts, adds the Claude hook, links `~/.local/bin/slack-ping`, installs the `slack-ping` skill,
+   then starts the relay and waits until it is connected:
 
    ```
    herdr plugin pane open --plugin densumesh.slack-agents --entrypoint setup     # popup in herdr
-   # or non-interactively:
-   ~/herdr-slack-agents/bin/setup --bot-token xoxb-... --app-token xapp-... --owner U012ABC \
-       [--owner-name Sam] [--claude-args="--dangerously-skip-permissions"]
+   ~/herdr-slack-agents/bin/setup                                               # or from a shell (linked copy)
    ```
 
+   Non-interactive: put the tokens in the environment (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`; never on the command
+   line) and pass `--owner U012ABC [--owner-name Sam] [--claude-args=--dangerously-skip-permissions]`.
+
 4. DM the bot `help`.
+
+Use one Slack app per person and host: two relays on one app token split Slack's events between them.
 
 ## Operate
 
 ```
-herdr plugin action invoke densumesh.slack-agents.status     # also .restart, .stop
+herdr plugin action invoke densumesh.slack-agents.status     # connected? last log lines; also .restart, .stop
 ```
 
-The relay is a detached process (one per user, `STATE/relay.lock`) restarted 10 s after any crash; herdr's
-startup hook (`bin/relay-ctl ensure`) starts it with the herdr server and restarts it after a plugin update.
-Config: `~/.config/herdr/plugins/config/densumesh.slack-agents/tokens.env` (0600; `CLAUDE_ARGS` = extra args for
-Claudes started from a DM, `OWNER_NAME` = name in the `[Slack from NAME, thread TS]` prompt prefix).
-State and logs: `~/.local/state/herdr/plugins/densumesh.slack-agents/` (`relay.log`, `relay.stderr`, `state.json`).
+- The relay is a detached process, one per user (`relay.lock`; on a shared NFS home the first host to start it
+  wins and `status` names that host). It is restarted after a crash (10 s, backing off to 5 min while it keeps
+  failing); `status` says "NOT connected" while it fails.
+- herdr's startup hook (`bin/relay-ctl ensure`) starts it with the herdr server and restarts it when the plugin
+  code changed or its herdr socket is gone. After `herdr plugin update` or a `git pull` of a linked copy, run the
+  `restart` action (or restart herdr).
+- One herdr server per user: the relay talks to the server that started it.
+- `stop` lasts until the next herdr server start.
+- Config: `~/.config/slack-agents/tokens.env` (0600; `CLAUDE_ARGS`, `OWNER_NAME` = the name in the
+  `[Slack from NAME, thread TS]` prompt prefix). Rerun setup with `--reset-tokens` to change tokens.
+- State and logs (0700): `~/.local/state/slack-agents/` (`relay.log`, `relay.stderr`, `state.json`, `inbox/`).
+- Wake-ups ride on `$XDG_RUNTIME_DIR/slack-relay`; without it the relay falls back to a 30 s poll.
 
-Only the configured owner's messages are acted on. Anyone holding the bot token can post as the bot; anyone who can
-DM as the owner can run Claude on this machine, with `CLAUDE_ARGS` permissions.
+Only the configured owner's DMs and button taps are acted on. Anyone holding the bot token can post as the bot;
+anyone who can send Slack messages as the owner can run Claude on this machine with `CLAUDE_ARGS` permissions.
 
 ## Uninstall
 
-`herdr plugin action invoke densumesh.slack-agents.stop`, `herdr plugin uninstall densumesh.slack-agents` (or `unlink`),
-remove the `slack-wake.sh` entries from `~/.claude/settings.json` and `~/.local/bin/slack-ping`.
+`bin/setup --uninstall` (stops the relay, removes the Claude hooks and `slack-ping`), then
+`herdr plugin uninstall densumesh.slack-agents` (or `unlink`). Config and state dirs are left for you to delete.

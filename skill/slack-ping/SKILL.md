@@ -26,4 +26,4 @@ ans=$(slack-ping --wait --timeout 1800 "Delete the old cache? (y/n)")   # script
 - Keep pings phone-sized: outcome first, numbers with how they were checked, then the one question. Finished work,
   blockers and OK-requests only, no progress chatter. Never put secrets in a ping.
 - Relay: `herdr plugin action invoke densumesh.slack-agents.status` (or `.restart`); log in
-  `~/.local/state/herdr/plugins/densumesh.slack-agents/relay.log`.
+  `~/.local/state/slack-agents/relay.log`. A `--wait` with no relay running warns on stderr.

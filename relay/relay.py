@@ -12,13 +12,13 @@
                               terminal too, headed by the prompt)
 - Slack's stop button      -> Esc in the agent's pane; top-level `status` / `help` are answered by the relay
 """
+import fcntl
 import functools
 import html
 import logging
 import logging.handlers
 import os
 import re
-import shlex
 import socket
 import threading
 import time
@@ -217,8 +217,9 @@ def spawn(ev, text):
         s["threads"][ts] = t
     agent = "slack-" + ts.replace(".", "")[-10:]
     for attempt in range(3):  # a brand-new shell may not be at its prompt yet
+        extra = ["--", *cfg["CLAUDE_ARGV"]] if cfg["CLAUDE_ARGV"] else []
         ok, res = herdr("agent", "start", agent, "--kind", "claude", "--pane", pane_id, "--timeout", "60000",
-                        "--", *shlex.split(cfg.get("CLAUDE_ARGS", "")), timeout=90)
+                        *extra, timeout=90)
         if ok or attempt == 2:
             break
         time.sleep(3)
@@ -309,8 +310,18 @@ def native_title(ts, t, title):
     native("agents.sessions.rename", channel_id=t["channel"], thread_ts=ts, title=title[:100])
 
 
+herdr_down = False
+
+
 def poll_once():
+    global herdr_down
     panes = agent_panes()
+    if (panes is None) != herdr_down:
+        herdr_down = panes is None
+        if herdr_down:
+            log.warning("herdr unreachable (%s); agent tracking paused", os.environ.get("HERDR_SOCKET_PATH", "herdr"))
+        else:
+            log.info("herdr reachable again")
     if panes is None:
         return
     redraw, statuses, titles = [], [], []
@@ -600,6 +611,11 @@ def on_request(client: SocketModeClient, req: SocketModeRequest):
 
 
 if __name__ == "__main__":
+    own = open(STATE_DIR / "relay.py.lock", "a")  # an orphan relay whose supervisor died keeps this, so no twin
+    try:
+        fcntl.flock(own, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("another relay.py is already connected (orphaned?); stop it first")
     log_file = STATE_DIR / "relay.log"
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         handlers=[logging.handlers.RotatingFileHandler(log_file, maxBytes=5 << 20, backupCount=2)])
@@ -607,6 +623,7 @@ if __name__ == "__main__":
     sm.socket_mode_request_listeners.append(on_request)
     sm.connect()
     log.info("connected")
+    (STATE_DIR / "relay.connected").write_text(f"{os.getpid()} {time.strftime('%F %T')}\n")
     threading.Thread(target=hook_listener, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     threading.Event().wait()

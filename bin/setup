@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
 """Set up the Slack Agents herdr plugin for this user (idempotent; rerun any time).
 
-  1. builds the plugin venv if missing (herdr builds it on `plugin install`; `plugin link` doesn't)
-  2. writes CONFIG/tokens.env from prompts or flags, after checking both tokens with Slack
+  1. builds the plugin venv if missing or broken (herdr builds it on `plugin install`; `plugin link` doesn't)
+  2. writes ~/.config/slack-agents/tokens.env after checking both tokens with Slack
   3. adds the wake hook to Claude Code's settings.json (backup kept next to it)
   4. links ~/.local/bin/slack-ping and installs the slack-ping skill for Claude (unless one exists)
-  5. starts (or restarts) the relay
+  5. starts (or restarts) the relay and waits until it is connected
 
-Flags skip the prompts: --bot-token xoxb-... --app-token xapp-... --owner U012ABC [--owner-name Sam]
---claude-args="--dangerously-skip-permissions" (passed to Claudes the relay starts from a top-level DM).
---migrate-from DIR copies tokens.env and state from a pre-plugin relay (DIR holds tokens.env; state in --old-state).
+Tokens are prompted for, or read from SLACK_BOT_TOKEN / SLACK_APP_TOKEN in the environment (never argv, which
+other users can read in `ps`). Rerun with --reset-tokens to replace stored ones.
 """
 import argparse
 import getpass
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PLUGIN_ID = "densumesh.slack-agents"
+sys.path.insert(0, str(ROOT / "relay"))
+from common import CONFIG_DIR, STATE_DIR, TOKENS, read_env  # noqa: E402  (also sets umask 077)
+
 HOME = Path.home()
-CONFIG = Path(os.environ.get("SLACK_AGENTS_CONFIG_DIR") or os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
-              or HOME / ".config/herdr/plugins/config" / PLUGIN_ID)
-STATE = Path(os.environ.get("SLACK_AGENTS_STATE_DIR") or os.environ.get("HERDR_PLUGIN_STATE_DIR")
-             or HOME / ".local/state/herdr/plugins" / PLUGIN_ID)
 CLAUDE = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
 HOOK_EVENTS = {"SessionStart": "*", "UserPromptSubmit": None, "PreToolUse": "*", "Notification": None, "Stop": None}
+HOOK_NAME = "slack-wake.sh"
+KEYS = ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "OWNER_SLACK_USER", "OWNER_NAME", "CLAUDE_ARGS")
+INTERACTIVE = sys.stdin.isatty()
+
+
+class Fail(Exception):
+    pass
 
 
 def say(msg):
@@ -41,156 +47,236 @@ def say(msg):
 def slack(method, token, **params):
     req = urllib.request.Request(f"https://slack.com/api/{method}", data=urllib.parse.urlencode(params).encode(),
                                  headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise Fail(f"can't reach Slack ({e})")
 
 
-def read_env(path):
-    cfg = {}
-    if path.exists():
-        for line in path.read_text().splitlines():
-            if "=" in line and not line.lstrip().startswith("#"):
-                k, v = line.split("=", 1)
-                cfg[k.strip()] = v.strip().strip("'\"")
-    return cfg
+def ask(prompt, secret=False):
+    if not INTERACTIVE:
+        raise Fail(f"missing {prompt} (no terminal to ask on)")
+    while True:
+        v = (getpass.getpass if secret else input)(f"  {prompt}: ").strip()
+        if v:
+            return v
+
+
+def yes(prompt):
+    return INTERACTIVE and input(f"  {prompt} [y/N]: ").strip().lower() in ("y", "yes")
 
 
 def ensure_venv():
     py = ROOT / ".venv/bin/python"
-    if py.exists():
+    if py.exists() and subprocess.run([str(py), "-c", "import slack_sdk.socket_mode"],
+                                      capture_output=True).returncode == 0:
         return
     say("building the plugin venv (python3 -m venv + slack-sdk)")
-    subprocess.run([sys.executable, "-m", "venv", str(ROOT / ".venv")], check=True)
-    subprocess.run([str(ROOT / ".venv/bin/pip"), "install", "--quiet", "--disable-pip-version-check", "-r",
-                    str(ROOT / "requirements.txt")], check=True)
+    shutil.rmtree(ROOT / ".venv", ignore_errors=True)
+    r = subprocess.run([sys.executable, "-m", "venv", str(ROOT / ".venv")], capture_output=True, text=True)
+    if r.returncode == 0:
+        r = subprocess.run([str(ROOT / ".venv/bin/pip"), "install", "--quiet", "--disable-pip-version-check", "-r",
+                            str(ROOT / "requirements.txt")], capture_output=True, text=True)
+    if r.returncode:
+        shutil.rmtree(ROOT / ".venv", ignore_errors=True)  # never leave a half-built venv that looks usable
+        raise Fail(f"venv build failed (Debian/Ubuntu may need `apt install python3-venv`):\n"
+                   f"{(r.stderr or r.stdout).strip()[-2000:]}")
 
 
-def ask(prompt, current, secret=False):
-    if current:
-        return current
-    if not sys.stdin.isatty():
-        sys.exit(f"setup: missing {prompt} (no terminal to ask on; pass it as a flag)")
-    return (getpass.getpass if secret else input)(f"  {prompt}: ").strip()
+def checked_token(cfg, key, prompt, check):
+    """Env/stored value if Slack accepts it, else prompt until it does (interactive) or fail."""
+    value = os.environ.get(key) or cfg.get(key)
+    while True:
+        if not value:
+            value = ask(prompt, secret=True)
+        err = check(value)
+        if not err:
+            return value
+        if not INTERACTIVE:
+            raise Fail(f"{key} rejected by Slack: {err}")
+        say(f"Slack rejected that token: {err}")
+        value = None
 
 
 def configure(a):
-    tokens = CONFIG / "tokens.env"
-    cfg = read_env(tokens)
+    cfg = read_env(TOKENS)
+    if a.reset_tokens:
+        cfg.pop("SLACK_BOT_TOKEN", None)
+        cfg.pop("SLACK_APP_TOKEN", None)
     if a.migrate_from:
         old = read_env(Path(a.migrate_from).expanduser() / "tokens.env")
         if not old:
-            sys.exit(f"setup: no tokens.env in {a.migrate_from}")
+            raise Fail(f"no tokens.env in {a.migrate_from}")
         old.setdefault("OWNER_SLACK_USER", old.pop("DENS_SLACK_USER", ""))
         cfg = {**old, **cfg}
-    for key, flag in (("SLACK_BOT_TOKEN", a.bot_token), ("SLACK_APP_TOKEN", a.app_token),
-                      ("OWNER_SLACK_USER", a.owner), ("OWNER_NAME", a.owner_name), ("CLAUDE_ARGS", a.claude_args)):
+    for key, flag in (("OWNER_SLACK_USER", a.owner), ("OWNER_NAME", a.owner_name), ("CLAUDE_ARGS", a.claude_args)):
         if flag is not None:
             cfg[key] = flag
-    if not cfg.get("SLACK_BOT_TOKEN") or not cfg.get("SLACK_APP_TOKEN") or not cfg.get("OWNER_SLACK_USER"):
+    if not (cfg.get("SLACK_BOT_TOKEN") or os.environ.get("SLACK_BOT_TOKEN")):
         print("Create the Slack app first: api.slack.com/apps -> Create New App -> From a manifest, paste\n"
-              f"{ROOT / 'slack-app-manifest.yaml'}, install it to your workspace, then copy the Bot User OAuth\n"
-              "Token (xoxb-...) and an app-level token with connections:write (xapp-...).")
-    cfg["SLACK_BOT_TOKEN"] = ask("bot token (xoxb-...)", cfg.get("SLACK_BOT_TOKEN"), secret=True)
-    cfg["SLACK_APP_TOKEN"] = ask("app token (xapp-...)", cfg.get("SLACK_APP_TOKEN"), secret=True)
-    cfg["OWNER_SLACK_USER"] = ask("your Slack member id (profile -> ... -> Copy member ID)",
-                                  cfg.get("OWNER_SLACK_USER"))
-    auth = slack("auth.test", cfg["SLACK_BOT_TOKEN"])
-    if not auth.get("ok"):
-        sys.exit(f"setup: bot token rejected by Slack: {auth.get('error')}")
-    conn = slack("apps.connections.open", cfg["SLACK_APP_TOKEN"])
-    if not conn.get("ok"):
-        sys.exit(f"setup: app token rejected by Slack: {conn.get('error')} (it needs connections:write)")
-    dm = slack("conversations.open", cfg["SLACK_BOT_TOKEN"], users=cfg["OWNER_SLACK_USER"])
-    if not dm.get("ok"):
-        sys.exit(f"setup: can't open a DM with Slack user {cfg['OWNER_SLACK_USER']}: {dm.get('error')}")
+              f"{ROOT / 'slack-app-manifest.yaml'} (rename the app if you like), install it to your workspace, then\n"
+              "copy the Bot User OAuth Token (xoxb-...) and create an app-level token with connections:write (xapp-...).")
+    auth = {}
+
+    def bot_ok(tok):
+        auth.clear()
+        auth.update(slack("auth.test", tok))
+        return None if auth.get("ok") else auth.get("error")
+
+    def app_ok(tok):
+        r = slack("apps.connections.open", tok)
+        return None if r.get("ok") else r.get("error")
+
+    cfg["SLACK_BOT_TOKEN"] = checked_token(cfg, "SLACK_BOT_TOKEN", "bot token (xoxb-...)", bot_ok)
+    cfg["SLACK_APP_TOKEN"] = checked_token(cfg, "SLACK_APP_TOKEN", "app-level token (xapp-..., connections:write)",
+                                           app_ok)
+    while True:
+        if not cfg.get("OWNER_SLACK_USER"):
+            cfg["OWNER_SLACK_USER"] = ask("your Slack member id (profile -> ... -> Copy member ID)")
+        dm = slack("conversations.open", cfg["SLACK_BOT_TOKEN"], users=cfg["OWNER_SLACK_USER"])
+        if dm.get("ok"):
+            break
+        if not INTERACTIVE:
+            raise Fail(f"can't open a DM with Slack user {cfg['OWNER_SLACK_USER']}: {dm.get('error')}")
+        say(f"can't open a DM with {cfg['OWNER_SLACK_USER']}: {dm.get('error')}")
+        cfg["OWNER_SLACK_USER"] = ""
     if not cfg.get("OWNER_NAME"):
         user = slack("users.info", cfg["SLACK_BOT_TOKEN"], user=cfg["OWNER_SLACK_USER"])
-        if user.get("ok"):
-            prof = user["user"].get("profile", {})
-            cfg["OWNER_NAME"] = (prof.get("first_name") or user["user"].get("real_name", "").split(" ")[0]
-                                 or user["user"]["name"])
-        else:
-            cfg["OWNER_NAME"] = ask(f"your name as agents should see it (users.info: {user.get('error')})", "")
-    cfg.setdefault("CLAUDE_ARGS", "")
-    CONFIG.mkdir(parents=True, exist_ok=True)
-    tmp = tokens.with_suffix(".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write("# Slack Agents (herdr plugin densumesh.slack-agents)\n")
-        for k in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "OWNER_SLACK_USER", "OWNER_NAME", "CLAUDE_ARGS"):
+        prof = user.get("user", {}).get("profile", {}) if user.get("ok") else {}
+        cfg["OWNER_NAME"] = (prof.get("first_name") or prof.get("real_name", "").split(" ")[0]
+                             or ask("your name, as agents should see it"))
+    if "CLAUDE_ARGS" not in cfg:
+        print("  A top-level DM to the bot starts a new Claude. Without extra args it stops at its first permission\n"
+              "  prompt, which you can only answer in herdr. Skipping permissions lets anyone who can send Slack\n"
+              "  messages as you run any command on this machine.")
+        skip = yes("Start those Claudes with --dangerously-skip-permissions?")
+        cfg["CLAUDE_ARGS"] = "--dangerously-skip-permissions" if skip else ""
+    try:
+        shlex.split(cfg["CLAUDE_ARGS"])
+    except ValueError as e:
+        raise Fail(f"CLAUDE_ARGS {cfg['CLAUDE_ARGS']!r} doesn't parse: {e}")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    tmp = TOKENS.with_suffix(".tmp")
+    tmp.unlink(missing_ok=True)
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+        f.write("# Slack Agents (herdr plugin densumesh.slack-agents); CLAUDE_ARGS = args for Claudes started "
+                "from a DM\n")
+        for k in KEYS:
             f.write(f"{k}={cfg[k]}\n")
-    os.replace(tmp, tokens)
-    say(f"config ok: bot {auth.get('user')} in {auth.get('team')}, owner {cfg['OWNER_NAME']} -> {tokens}")
+    os.replace(tmp, TOKENS)
+    say(f"config ok: bot {auth.get('user')} in {auth.get('team')}, owner {cfg['OWNER_NAME']}, "
+        f"CLAUDE_ARGS={cfg['CLAUDE_ARGS'] or '(none)'} -> {TOKENS}")
 
 
-def migrate_state(old_state):
-    old = Path(old_state).expanduser()
-    if (STATE / "state.json").exists():
-        say(f"state already present in {STATE}; not migrating")
+def retire_old_relay(old_state):
+    """Stop the pre-plugin systemd relay (two relays on one app token split Slack's events) and copy its state."""
+    unit = "slack-relay.service"
+    if shutil.which("systemctl"):
+        act = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True, text=True)
+        ena = subprocess.run(["systemctl", "--user", "is-enabled", unit], capture_output=True, text=True)
+        if act.stdout.strip() == "active" or ena.stdout.strip() == "enabled":
+            subprocess.run(["systemctl", "--user", "disable", "--now", unit], check=True, capture_output=True)
+            say(f"stopped and disabled the old {unit}")
+    if not old_state:
         return
-    STATE.mkdir(parents=True, exist_ok=True)
+    old = Path(old_state).expanduser()
+    if (STATE_DIR / "state.json").exists():
+        say(f"state already present in {STATE_DIR}; not copying {old}")
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     for name in ("state.json", "replies", "inbox"):
         src = old / name
         if src.is_dir():
-            shutil.copytree(src, STATE / name, dirs_exist_ok=True)
+            shutil.copytree(src, STATE_DIR / name, dirs_exist_ok=True)
         elif src.exists():
-            shutil.copy2(src, STATE / name)
+            shutil.copy2(src, STATE_DIR / name)
     say(f"copied relay state from {old}")
 
 
+def load_settings():
+    path = CLAUDE / "settings.json"
+    try:
+        return path, (json.loads(path.read_text()) if path.exists() else {})
+    except json.JSONDecodeError as e:
+        raise Fail(f"{path} isn't valid JSON ({e}); fix it or rerun with --no-hooks")
+
+
+def write_settings(path, settings):
+    real = path.resolve()  # keep a dotfile manager's symlink intact
+    real.parent.mkdir(parents=True, exist_ok=True)
+    tmp = real.with_name(real.name + ".slack-agents.tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    if real.exists():
+        shutil.copy2(real, real.with_name(f"{real.name}.bak-slack-agents-{time.strftime('%Y%m%d%H%M%S')}"))
+        shutil.copymode(real, tmp)
+    else:
+        tmp.chmod(0o644)
+    os.replace(tmp, real)
+
+
+def is_ours(hook):
+    cmd = hook.get("command", "")
+    return cmd.endswith("/" + HOOK_NAME) and "slack-agents" in cmd
+
+
 def install_hook():
-    hook = CONFIG / "slack-wake.sh"
-    shutil.copy2(ROOT / "hooks/slack-wake.sh", hook)
-    hook.chmod(0o755)
-    settings_path = CLAUDE / "settings.json"
-    settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    hook = CONFIG_DIR / HOOK_NAME
+    shutil.copy2(ROOT / "hooks" / HOOK_NAME, hook)
+    hook.chmod(0o700)
+    path, settings = load_settings()
     hooks = settings.setdefault("hooks", {})
-    added = []
+    changed = []
     for event, matcher in HOOK_EVENTS.items():
         groups = hooks.setdefault(event, [])
-        if any(h.get("command") == str(hook) for g in groups for h in g.get("hooks", [])):
-            continue
-        group = {"hooks": [{"type": "command", "command": str(hook), "timeout": 5}]}
-        if matcher:
-            group["matcher"] = matcher
-        groups.append(group)
-        added.append(event)
-    if added:
-        if settings_path.exists():
-            backup = settings_path.with_name(f"settings.json.bak-slack-agents-{time.strftime('%Y%m%d%H%M%S')}")
-            shutil.copy2(settings_path, backup)
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = settings_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(settings, indent=2) + "\n")
-        os.replace(tmp, settings_path)
-        say(f"Claude hooks added for {', '.join(added)} in {settings_path}")
+        ours = [h for g in groups for h in g.get("hooks", []) if is_ours(h)]
+        for h in ours:  # from an earlier install path (moved config dir): repoint it
+            if h["command"] != str(hook):
+                h["command"] = str(hook)
+                changed.append(event)
+        if not ours:
+            group = {"hooks": [{"type": "command", "command": str(hook), "timeout": 5}]}
+            if matcher:
+                group["matcher"] = matcher
+            groups.append(group)
+            changed.append(event)
+    if changed:
+        write_settings(path, settings)
+        say(f"Claude hooks set for {', '.join(changed)} in {path}")
     else:
         say("Claude hooks already installed")
     herdr = os.environ.get("HERDR_BIN_PATH") or shutil.which("herdr") or "herdr"
-    st = subprocess.run([herdr, "integration", "status"], capture_output=True, text=True)
-    line = next((x for x in st.stdout.splitlines() if x.startswith("claude:")), "")
-    if "not installed" in line or not line:
+    try:
+        st = subprocess.run([herdr, "integration", "status"], capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        st = ""
+        say(f"WARNING: can't run herdr ({e})")
+    line = next((x for x in st.splitlines() if x.startswith("claude:")), "")
+    if not line or "not installed" in line:
         say("WARNING: herdr's Claude integration is missing; run `herdr integration install claude` "
             "(the relay needs it to tell Claude sessions apart)")
 
 
 def install_cli_and_skill(force_skill):
-    STATE.mkdir(parents=True, exist_ok=True)
-    current = STATE / "current"
-    if current.is_symlink() or not current.exists():
-        tmp = STATE / "current.tmp"
-        tmp.unlink(missing_ok=True)
-        tmp.symlink_to(ROOT)
-        os.replace(tmp, current)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    current = STATE_DIR / "current"
+    tmp = STATE_DIR / "current.tmp"
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(ROOT)
+    os.replace(tmp, current)
     bindir = HOME / ".local/bin"
     bindir.mkdir(parents=True, exist_ok=True)
     link, target = bindir / "slack-ping", current / "bin/slack-ping"
-    if link.is_symlink() or not link.exists():
+    if link.exists() and not link.is_symlink():
+        backup = link.with_name("slack-ping.bak-slack-agents")
+        link.replace(backup)
+        say(f"moved the old {link} to {backup}")
+    if not (link.is_symlink() and Path(os.readlink(link)) == target):
         link.unlink(missing_ok=True)
         link.symlink_to(target)
         say(f"{link} -> {target}")
-    else:
-        say(f"WARNING: {link} exists and isn't a symlink; left alone (point it at {target})")
     if shutil.which("slack-ping") is None:
         say(f"WARNING: {bindir} isn't on PATH")
     skill = CLAUDE / "skills/slack-ping/SKILL.md"
@@ -202,37 +288,75 @@ def install_cli_and_skill(force_skill):
         say(f"installed skill {skill}")
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bot-token")
-    ap.add_argument("--app-token")
-    ap.add_argument("--owner", help="your Slack member id (U...)")
-    ap.add_argument("--owner-name", help="name agents see in '[Slack from NAME, thread ...]' (default: Slack first name)")
-    ap.add_argument("--claude-args", help="extra args for Claudes started from a top-level DM")
-    ap.add_argument("--migrate-from", help="dir with a pre-plugin tokens.env (DENS_SLACK_USER is renamed)")
-    ap.add_argument("--old-state", help="pre-plugin state dir to copy (state.json, replies/, inbox/)")
-    ap.add_argument("--no-hooks", action="store_true", help="don't touch Claude's settings.json")
-    ap.add_argument("--force-skill", action="store_true", help="replace an existing slack-ping skill")
-    ap.add_argument("--no-start", action="store_true", help="don't (re)start the relay")
-    a = ap.parse_args()
+def uninstall():
+    subprocess.run([str(ROOT / "bin/relay-ctl"), "stop"])
+    path, settings = load_settings()
+    n = 0
+    for event, groups in settings.get("hooks", {}).items():
+        for g in groups:
+            keep = [h for h in g.get("hooks", []) if not is_ours(h)]
+            n += len(g.get("hooks", [])) - len(keep)
+            g["hooks"] = keep
+        settings["hooks"][event] = [g for g in groups if g["hooks"]]
+    if n:
+        write_settings(path, settings)
+    say(f"removed {n} Claude hook entries")
+    link = HOME / ".local/bin/slack-ping"
+    if link.is_symlink() and "slack-agents" in os.readlink(link):
+        link.unlink()
+        say(f"removed {link}")
+    say(f"kept {CONFIG_DIR} (tokens) and {STATE_DIR} (threads, logs); delete them yourself if you want")
+    say("finish with: herdr plugin uninstall densumesh.slack-agents  (or `herdr plugin unlink` for a linked copy)")
+
+
+def main(a):
     print(f"Slack Agents setup ({ROOT})")
+    if a.uninstall:
+        uninstall()
+        return
+    if not a.no_hooks:
+        load_settings()  # fail on a broken settings.json before changing anything
     ensure_venv()
     configure(a)
-    if a.old_state:
-        migrate_state(a.old_state)
+    if a.migrate_from or a.old_state:
+        retire_old_relay(a.old_state)
     if not a.no_hooks:
         install_hook()
     install_cli_and_skill(a.force_skill)
     if not a.no_start:
         ctl = str(ROOT / "bin/relay-ctl")
-        if subprocess.run([ctl, "status"], capture_output=True, text=True).stdout.startswith("relay running"):
-            subprocess.run([ctl, "restart"], check=True)
-        else:
-            subprocess.run([ctl, "ensure"], check=True)
+        if subprocess.run([ctl, "restart"]).returncode:
+            raise Fail(f"the relay didn't connect; see `{ctl} status`")
     print("Done. DM the bot `help` to check it, or run `slack-ping \"hello\"` from an agent pane.")
-    if sys.stdin.isatty() and os.environ.get("HERDR_PLUGIN_ENTRYPOINT_ID"):
-        input("Press Enter to close.")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--owner", help="your Slack member id (U...)")
+    ap.add_argument("--owner-name", help="name agents see in '[Slack from NAME, thread ...]' (default: Slack first name)")
+    ap.add_argument("--claude-args", help="args for Claudes started from a top-level DM; use the --claude-args=... "
+                                          "form, e.g. --claude-args=--dangerously-skip-permissions ('' for none)")
+    ap.add_argument("--reset-tokens", action="store_true", help="ask for new tokens instead of reusing stored ones")
+    ap.add_argument("--migrate-from", help="dir with a pre-plugin tokens.env (DENS_SLACK_USER is renamed); also "
+                                           "stops and disables the old slack-relay systemd unit")
+    ap.add_argument("--old-state", help="pre-plugin state dir to copy (state.json, replies/, inbox/)")
+    ap.add_argument("--no-hooks", action="store_true", help="don't touch Claude's settings.json")
+    ap.add_argument("--force-skill", action="store_true", help="replace an existing slack-ping skill")
+    ap.add_argument("--no-start", action="store_true", help="don't (re)start the relay")
+    ap.add_argument("--uninstall", action="store_true", help="stop the relay, remove the Claude hooks and slack-ping")
+    args = ap.parse_args()
+    code = 0
+    try:
+        main(args)
+    except Fail as e:
+        print(f"setup failed: {e}", file=sys.stderr)
+        code = 1
+    except (KeyboardInterrupt, EOFError):
+        print("\nsetup cancelled", file=sys.stderr)
+        code = 1
+    except Exception as e:  # the popup closes when we exit: show the error before it does
+        print(f"setup crashed: {type(e).__name__}: {e}", file=sys.stderr)
+        code = 1
+    if INTERACTIVE and os.environ.get("HERDR_PLUGIN_ENTRYPOINT_ID"):
+        input("Press Enter to close.")
+    sys.exit(code)

@@ -21,7 +21,8 @@ from pathlib import Path
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-from common import ICONS, REPLIES, card_blocks, md_blocks, choice_blocks, herdr, load_config, now, state, thread_for
+from common import (ICONS, REPLIES, card_blocks, md_blocks, choice_blocks, herdr, load_config, now, relay_running,
+                    state, thread_for)
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
@@ -107,6 +108,9 @@ def main():
     choices = [c.strip() for c in a.choices.split(",") if c.strip()] if a.choices else []
 
     cfg = load_config()
+    if (a.wait or choices) and not relay_running():
+        print("slack-ping: warning: the relay isn't running, so replies won't arrive until it starts "
+              "(herdr plugin action invoke densumesh.slack-agents.status)", file=sys.stderr)
     client = WebClient(token=cfg["SLACK_BOT_TOKEN"])
     channel = client.conversations_open(users=cfg["OWNER_SLACK_USER"])["channel"]["id"]
     ctx = herdr_context()
