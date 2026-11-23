@@ -30,13 +30,19 @@ def _open():
 def watch():
     """Yield once per burst of hook writes (blocks until the next one). When the directory goes away (logind
     removes the runtime dir at logout), retry every 30 s until it can be recreated, polling meanwhile."""
+    warned = False
     while True:
         try:
             f = _open()
         except OSError as e:
-            log.warning("hook wake-ups unavailable (%s); retrying in 30 s", e)
+            if not warned:
+                log.warning("hook wake-ups unavailable (%s); polling, retrying every 30 s", e)
+                warned = True
             time.sleep(30)
             continue
+        if warned:
+            log.info("hook wake-ups back")
+            warned = False
         with f:
             gone = False
             while not gone:

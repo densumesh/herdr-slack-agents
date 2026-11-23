@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -85,8 +86,11 @@ def ensure_venv():
 
 
 def checked_token(cfg, key, prompt, check):
-    """Env/stored value if Slack accepts it, else prompt until it does (interactive) or fail."""
-    value = os.environ.get(key) or cfg.get(key)
+    """Stored value (or, if none, the environment's) if Slack accepts it, else prompt until it does or fail."""
+    value = cfg.get(key)
+    if not value and os.environ.get(key):
+        value = os.environ[key]
+        say(f"using {key} from the environment")
     while True:
         if not value:
             value = ask(prompt, secret=True)
@@ -137,7 +141,7 @@ def configure(a):
         dm = slack("conversations.open", cfg["SLACK_BOT_TOKEN"], users=cfg["OWNER_SLACK_USER"])
         if dm.get("ok"):
             break
-        if not INTERACTIVE:
+        if not INTERACTIVE or dm.get("error") not in ("user_not_found", "invalid_users", "user_disabled"):
             raise Fail(f"can't open a DM with Slack user {cfg['OWNER_SLACK_USER']}: {dm.get('error')}")
         say(f"can't open a DM with {cfg['OWNER_SLACK_USER']}: {dm.get('error')}")
         cfg["OWNER_SLACK_USER"] = ""
@@ -305,12 +309,29 @@ def uninstall():
     if link.is_symlink() and "slack-agents" in os.readlink(link):
         link.unlink()
         say(f"removed {link}")
+    skill = CLAUDE / "skills/slack-ping/SKILL.md"
+    if skill.exists() and skill.read_bytes() == (ROOT / "skill/slack-ping/SKILL.md").read_bytes():
+        shutil.rmtree(skill.parent)
+        say(f"removed {skill.parent}")
     say(f"kept {CONFIG_DIR} (tokens) and {STATE_DIR} (threads, logs); delete them yourself if you want")
     say("finish with: herdr plugin uninstall densumesh.slack-agents  (or `herdr plugin unlink` for a linked copy)")
 
 
+def relay_host():
+    """Host whose relay holds the lock, if it's another one (NFS home shared across hosts)."""
+    pid = STATE_DIR / "relay.pid"
+    host = pid.read_text().split()[1:2] if pid.exists() else []
+    if not host or host[0] == socket.gethostname():
+        return None
+    return host[0] if subprocess.run([str(ROOT / "bin/relay-ctl"), "status"], capture_output=True,
+                                     text=True).stdout.startswith("relay running on") else None
+
+
 def main(a):
     print(f"Slack Agents setup ({ROOT})")
+    other = relay_host()
+    if other:
+        raise Fail(f"the relay runs on {other} (shared home); run setup there, or stop it there first")
     if a.uninstall:
         uninstall()
         return

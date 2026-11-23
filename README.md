@@ -35,7 +35,8 @@ integration (`herdr integration install claude`).
 
 4. DM the bot `help`.
 
-Use one Slack app per person and host: two relays on one app token split Slack's events between them.
+Use one Slack app per person and host: two relays on one app token split Slack's events between them. On a
+home directory shared by several hosts, install and run setup on one host; the others leave its relay alone.
 
 ## Operate
 

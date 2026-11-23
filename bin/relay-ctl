@@ -9,7 +9,7 @@ mkdir -p "$STATE" && chmod -R go-rwx "$STATE" "$CONFIG" 2>/dev/null
 LOCK="$STATE/relay.lock"
 HOST=$(hostname)
 
-running() { [ -e "$LOCK" ] && ! flock -n "$LOCK" true; }
+running() { [ -e "$LOCK" ] && ! flock -s -n "$LOCK" true; }
 pid() { cut -d' ' -f1 "$STATE/relay.pid" 2>/dev/null; }
 pidhost() { cut -d' ' -f2 "$STATE/relay.pid" 2>/dev/null; }
 fingerprint() { cat "$ROOT"/relay/*.py | md5sum | cut -d' ' -f1; }
@@ -21,8 +21,9 @@ connected() {  # the relay writes relay.connected (its pid) once Slack accepted 
     [ -n "$c" ] && [ "$(pidhost)" = "$HOST" ] && kill -0 "$c" 2>/dev/null
 }
 
+elsewhere() { running && [ "$(pidhost)" != "$HOST" ]; }
+
 start() {
-    ln -sfn "$ROOT" "$STATE/current"
     if [ ! -s "$CONFIG/tokens.env" ]; then
         echo "slack-agents: not configured ($CONFIG/tokens.env missing); run setup" >&2
         return 1
@@ -32,6 +33,7 @@ start() {
         return 1
     fi
     running && { echo "relay already running (pid $(pid) on $(pidhost))"; return 0; }
+    ln -sfn "$ROOT" "$STATE/current"
     # herdr's per-invocation context would be stale for a long-lived daemon; keep only the socket and binary
     ( unset HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_PLUGIN_CONTEXT_JSON HERDR_PLUGIN_ACTION_ID \
             HERDR_PLUGIN_EVENT HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_ENTRYPOINT_ID HERDR_ENV
@@ -69,6 +71,7 @@ stale() {  # why a running relay should be restarted by ensure (empty = keep it)
 
 case "${1:-}" in
 ensure)
+    elsewhere && { echo "relay runs on $(pidhost) (shared home); leaving it and STATE/current alone"; exit 0; }
     ln -sfn "$ROOT" "$STATE/current"
     [ -s "$CONFIG/tokens.env" ] || { echo "slack-agents: not configured yet; run setup"; exit 0; }
     if running; then

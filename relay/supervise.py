@@ -36,29 +36,36 @@ def die_with_parent():
 
 
 def stop(signum, frame):
+    """Only flag and forward: the main loop is inside child.wait(), which holds Popen's lock, so waiting here would
+    stall until the timeout. The loop sees the flag once the relay has exited."""
+    global stopping
+    stopping = True
     if child and child.poll() is None:
-        child.terminate()
-        try:
-            child.wait(10)
-        except subprocess.TimeoutExpired:
-            child.kill()
-    (STATE_DIR / "relay.connected").unlink(missing_ok=True)
-    sys.exit(0)
+        os.kill(child.pid, signal.SIGTERM)
 
 
+stopping = False
 signal.signal(signal.SIGTERM, stop)
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
+(STATE_DIR / "relay.connected").unlink(missing_ok=True)  # left by a SIGKILLed predecessor
 delay = 5  # doubled before the first wait: 10 s, then up to 5 min while it keeps failing fast
-while True:
-    (STATE_DIR / "relay.connected").unlink(missing_ok=True)
+while not stopping:
     if STDERR.exists() and STDERR.stat().st_size > 1 << 20:
         STDERR.replace(STDERR.with_suffix(".stderr.1"))
     started = time.time()
     with open(STDERR, "a") as err:
         child = subprocess.Popen([sys.executable, "relay.py"], stdin=subprocess.DEVNULL, stdout=err, stderr=err,
                                  preexec_fn=die_with_parent)
-        code = child.wait()
+        try:
+            code = child.wait(timeout=None)
+        finally:
+            (STATE_DIR / "relay.connected").unlink(missing_ok=True)
+        if stopping:
+            break
         delay = 10 if time.time() - started > 300 else min(delay * 2, 300)
         err.write(f"{time.strftime('%F %T')} relay exited ({code}), restarting in {delay} s\n")
-    time.sleep(delay)
+    for _ in range(delay * 10):  # sleep, but leave promptly on SIGTERM
+        if stopping:
+            break
+        time.sleep(0.1)

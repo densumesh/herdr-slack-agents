@@ -47,7 +47,7 @@ def read_env(path):
         if "=" in line and not line.lstrip().startswith("#"):
             k, v = line.split("=", 1)
             v = v.strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"" and k.strip() != "CLAUDE_ARGS":  # that one is shlex
                 v = v[1:-1]
             cfg[k.strip()] = v
     return cfg
@@ -66,9 +66,11 @@ def load_config():
 def relay_running():
     """True while a relay supervisor holds the lock (on any host sharing this home)."""
     try:
-        with open(STATE_DIR / "relay.lock", "a") as f:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with open(STATE_DIR / "relay.lock") as f:
+            fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)  # shared: concurrent probes don't see each other
             return False
+    except FileNotFoundError:
+        return False
     except BlockingIOError:
         return True
 
