@@ -1,0 +1,41 @@
+id = "densumesh.slack-agents"
+name = "Slack Agents"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Drive your herdr Claude/Codex agents from a Slack DM: one live thread per agent session, replies typed into its pane, slack-ping for agents"
+platforms = ["linux"]
+
+[[build]]
+command = ["python3", "-m", "venv", ".venv"]
+
+[[build]]
+command = [".venv/bin/pip", "install", "--quiet", "--disable-pip-version-check", "-r", "requirements.txt"]
+
+[[startup]]
+command = ["bin/relay-ctl", "ensure"]
+
+[[panes]]
+id = "setup"
+title = "Slack Agents setup"
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["bin/setup"]
+
+[[actions]]
+id = "restart"
+title = "Slack Agents: restart relay"
+contexts = ["workspace"]
+command = ["bin/relay-ctl", "restart"]
+
+[[actions]]
+id = "stop"
+title = "Slack Agents: stop relay"
+contexts = ["workspace"]
+command = ["bin/relay-ctl", "stop"]
+
+[[actions]]
+id = "status"
+title = "Slack Agents: relay status"
+contexts = ["workspace"]
+command = ["bin/relay-ctl", "status"]

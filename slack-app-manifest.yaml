@@ -1,0 +1,39 @@
+display_information:
+  name: Herdr Agents
+  description: Pings you from your herdr Claude/Codex agents and relays your replies back.
+features:
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  agent_view:
+    agent_description: Your Claude/Codex agents in herdr. Message to start one; reply in a thread to steer it.
+    suggested_prompts:
+      - title: What are my agents doing?
+        message: status
+      - title: How does this work?
+        message: help
+  bot_user:
+    display_name: herdr-agents
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - assistant:write
+      - chat:write
+      - chat:write.customize
+      - files:read
+      - files:write
+      - im:history
+      - im:write
+      - reactions:write
+      - users:read
+settings:
+  event_subscriptions:
+    bot_events:
+      - message.im
+      - agent_session_stopped
+  interactivity:
+    is_enabled: true
+  socket_mode_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false

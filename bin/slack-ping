@@ -1,0 +1,4 @@
+#!/bin/sh
+# slack-ping CLI (setup links ~/.local/bin/slack-ping here). See `slack-ping --help`.
+. "$(dirname "$(readlink -f "$0")")/env.sh"
+exec "$PY" "$ROOT/relay/slack_ping.py" "$@"

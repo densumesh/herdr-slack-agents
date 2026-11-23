@@ -1,0 +1,60 @@
+#!/bin/sh
+# relay-ctl ensure|start|stop|restart|status — run the Slack relay as a detached, self-restarting process.
+# `ensure` is the herdr startup hook: it points STATE/current at this installation and (re)starts the relay
+# when it is down or still running an older installation. One relay per user, guarded by STATE/relay.lock.
+set -u
+. "$(dirname "$(readlink -f "$0")")/env.sh"
+mkdir -p "$STATE"
+LOCK="$STATE/relay.lock"
+
+running() { [ -e "$LOCK" ] && ! flock -n "$LOCK" true; }
+pid() { cat "$STATE/relay.pid" 2>/dev/null; }
+
+start() {
+    if [ ! -s "$CONFIG/tokens.env" ]; then
+        echo "slack-agents: not configured ($CONFIG/tokens.env missing); run setup first" >&2
+        return 1
+    fi
+    if [ ! -x "$PY" ]; then
+        echo "slack-agents: no venv at $ROOT/.venv; run setup first" >&2
+        return 1
+    fi
+    running && { echo "relay already running (pid $(pid))"; return 0; }
+    setsid -f "$ROOT/bin/relay-ctl" _supervise </dev/null >/dev/null 2>&1
+    for _ in 1 2 3 4 5 6 7 8 9 10; do running && break; sleep 0.2; done
+    running && echo "relay started (pid $(pid), $ROOT)" || { echo "relay failed to start" >&2; return 1; }
+}
+
+stop() {
+    running || { echo "relay not running"; return 0; }
+    p=$(pid)
+    [ -n "$p" ] && /bin/kill -TERM "$p"
+    for _ in $(seq 150); do running || break; sleep 0.1; done
+    if running; then  # the supervisor leads its own process group (setsid): take the relay down with it
+        /bin/kill -KILL -- "-$p"
+        sleep 0.5
+    fi
+    running && { echo "relay (pid $p) did not stop" >&2; return 1; }
+    echo "relay stopped"
+}
+
+case "${1:-}" in
+_supervise)
+    # herdr's per-invocation context would be stale for a long-lived daemon; keep only the socket and binary
+    unset HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_PLUGIN_CONTEXT_JSON HERDR_PLUGIN_ACTION_ID \
+          HERDR_PLUGIN_EVENT HERDR_PLUGIN_EVENT_JSON HERDR_PLUGIN_ENTRYPOINT_ID HERDR_ENV
+    cd "$ROOT/relay" && exec "$PY" supervise.py ;;
+ensure)
+    ln -sfn "$ROOT" "$STATE/current"
+    if running && [ "$(cat "$STATE/relay.root" 2>/dev/null)" != "$ROOT" ]; then stop; fi
+    if [ -s "$CONFIG/tokens.env" ]; then start; else echo "slack-agents: not configured yet; run setup"; fi ;;
+start) start ;;
+stop) stop ;;
+restart) stop && start ;;
+status)
+    if running; then echo "relay running (pid $(pid), $(cat "$STATE/relay.root" 2>/dev/null))"
+    else echo "relay not running"; fi
+    echo "config: $CONFIG"; echo "state:  $STATE"
+    tail -n 5 "$STATE/relay.log" 2>/dev/null ;;
+*) echo "usage: relay-ctl ensure|start|stop|restart|status" >&2; exit 2 ;;
+esac
